@@ -6,9 +6,12 @@ import numpy as np
 import tensorboardX
 import torch
 import torchvision
-from apex import amp
+# from apex import amp
 from prefetch_generator import BackgroundGenerator
+from resnet_cifar import ResNet32_CIFAR
+# from pudb import set_trace
 from torch import distributed as dist
+from torch.cuda.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -16,7 +19,6 @@ from torchvision import transforms
 from tqdm import tqdm
 
 from metrics import AverageMeter, ExpStat
-from resnet_cifar import ResNet32_CIFAR
 
 
 class DataLoaderX(DataLoader):
@@ -138,7 +140,8 @@ def main(args):
     if args.local_rank != -1:
         if args.local_rank in [-1, 0]:
             print("Initializing DistributedDataParallel...")
-        model, optimizer = amp.initialize(model, optimizer, opt_level='O1')
+        args.scaler = GradScaler()
+        # model, optimizer = amp.initialize(model, optimizer, opt_level='O1')
         model = DistributedDataParallel(model,
                                         device_ids=[args.local_rank],
                                         output_device=args.local_rank)
@@ -176,7 +179,6 @@ def main(args):
             num_samples_per_cls=train_num_samples_per_cls,
             args=args,
         )
-
         val_stat, val_loss = eval_epoch(
             epoch=epoch,
             val_loader=val_loader,
@@ -220,9 +222,10 @@ def train_epoch(epoch, train_loader, model, criterion, optimizer, lr_scheduler,
         optimizer.zero_grad()
 
         batch_imgs, batch_targets = batch_imgs.cuda(), batch_targets.cuda()
-        batch_probs = model(batch_imgs)
 
-        batch_avg_loss = criterion(batch_probs, batch_targets)
+        with autocast():  # torch自动混合精度
+            batch_probs = model(batch_imgs)
+            batch_avg_loss = criterion(batch_probs, batch_targets)
 
         if args.local_rank != -1:
             torch.distributed.barrier()
@@ -230,9 +233,18 @@ def train_epoch(epoch, train_loader, model, criterion, optimizer, lr_scheduler,
             # 确保每个进程都运行到这一行代码，才能继续执行，这样计算
             # 平均loss和平均acc的时候，不会出现因为进程执行速度不一致
             # 而导致错误
-            with amp.scale_loss(batch_avg_loss, optimizer) as scaled_loss:
-                scaled_loss.backward()
-            optimizer.step()
+            # Scales loss，这是因为半精度的数值范围有限，因此需要用它放大
+            args.scaler.scale(batch_avg_loss).backward()
+
+            # unscale之前放大后的梯度，但是scale太多可能出现inf或NaN
+            # 故scaler会判断是否出现了inf/NaN
+            # 如果梯度的值不是 infs 或者 NaNs, 那么调用optimizer.step()来更新权重,
+            # 如果检测到出现了inf或者NaN，就跳过这次梯度更新，同时动态调整scaler的大小
+            args.scaler.step(optimizer)
+            # optimizer.step()
+
+            # 查看是否要更新scaler,这个要注意不能丢
+            args.scaler.update()
             batch_avg_loss = _reduce_tensor(args, batch_avg_loss)
         else:
             batch_avg_loss.backward()
@@ -280,8 +292,10 @@ def eval_epoch(epoch, val_loader, model, criterion, num_samples_per_cls, args):
     for i, (batch_imgs, batch_targets) in enumerate(val_loader):
 
         batch_imgs, batch_targets = batch_imgs.cuda(), batch_targets.cuda()
-        batch_probs = model(batch_imgs)
-        batch_avg_loss = criterion(batch_probs, batch_targets)
+
+        with autocast():
+            batch_probs = model(batch_imgs)
+            batch_avg_loss = criterion(batch_probs, batch_targets)
 
         if args.local_rank != -1:
             torch.distributed.barrier()
@@ -368,6 +382,8 @@ def parse_args():
 
 if __name__ == '__main__':
     args = parse_args()
-    args.local_rank = int(os.environ["LOCAL_RANK"])
+
+    if "LOCAL_RANK" in os.environ:
+        args.local_rank = int(os.environ["LOCAL_RANK"])
     _set_random_seed(args.seed)
     main(args)
