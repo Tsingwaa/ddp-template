@@ -6,12 +6,9 @@ import numpy as np
 import tensorboardX
 import torch
 import torchvision
-# from apex import amp
 from prefetch_generator import BackgroundGenerator
-from resnet_cifar import ResNet32_CIFAR
 # from pudb import set_trace
 from torch import distributed as dist
-from torch.cuda.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -34,9 +31,8 @@ def main(args):
     #######################################################################
 
     if args.local_rank != -1:
-        dist.init_process_group(backend='nccl')
         torch.cuda.set_device(args.local_rank)
-        args.global_rank = dist.get_rank()
+        dist.init_process_group(backend='nccl')
         args.world_size = dist.get_world_size()
 
     if args.local_rank in [-1, 0]:
@@ -73,13 +69,13 @@ def main(args):
                                           train=False,
                                           transform=transform["val"],
                                           download=True)
-
     val_num_samples_per_cls = [
         valset.targets.count(i) for i in range(len(valset.classes))
     ]
     # DistributedSampler 负责数据分发到多卡
 
     if args.local_rank != -1:
+        args.batch_size = int(args.batch_size / args.world_size)
         train_sampler = DistributedSampler(trainset)
         val_sampler = DistributedSampler(valset)
     else:
@@ -112,7 +108,8 @@ def main(args):
 
     if args.local_rank in [-1, 0]:
         print("Initializing Model...")
-    model = ResNet32_CIFAR(num_classes=len(trainset.classes)).cuda()
+    model = torchvision.models.resnet18(
+        num_classes=len(trainset.classes)).cuda()
 
     #######################################################################
     # 初始化 Loss
@@ -140,8 +137,6 @@ def main(args):
     if args.local_rank != -1:
         if args.local_rank in [-1, 0]:
             print("Initializing DistributedDataParallel...")
-        args.scaler = GradScaler()
-        # model, optimizer = amp.initialize(model, optimizer, opt_level='O1')
         model = DistributedDataParallel(model,
                                         device_ids=[args.local_rank],
                                         output_device=args.local_rank)
@@ -152,7 +147,9 @@ def main(args):
 
     if args.local_rank in [-1, 0]:
         print("Initializing lr_scheduler...")
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30)
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer,
+                                                   step_size=30,
+                                                   gamma=0.1)
 
     #######################################################################
     # 开始训练
@@ -168,6 +165,7 @@ def main(args):
             # 程序各取所需，详情看源代码
             train_sampler.set_epoch(epoch)
             val_sampler.set_epoch(epoch)
+            dist.barrier()
 
         train_stat, train_loss = train_epoch(
             epoch=epoch,
@@ -223,29 +221,18 @@ def train_epoch(epoch, train_loader, model, criterion, optimizer, lr_scheduler,
 
         batch_imgs, batch_targets = batch_imgs.cuda(), batch_targets.cuda()
 
-        with autocast():  # torch自动混合精度
-            batch_probs = model(batch_imgs)
-            batch_avg_loss = criterion(batch_probs, batch_targets)
+        batch_probs = model(batch_imgs)
+        batch_avg_loss = criterion(batch_probs, batch_targets)
 
         if args.local_rank != -1:
-            torch.distributed.barrier()
+            dist.barrier()
             # torch.distributed.barrier()的作用是，阻塞进程
             # 确保每个进程都运行到这一行代码，才能继续执行，这样计算
             # 平均loss和平均acc的时候，不会出现因为进程执行速度不一致
             # 而导致错误
-            # Scales loss，这是因为半精度的数值范围有限，因此需要用它放大
-            args.scaler.scale(batch_avg_loss).backward()
-
-            # unscale之前放大后的梯度，但是scale太多可能出现inf或NaN
-            # 故scaler会判断是否出现了inf/NaN
-            # 如果梯度的值不是 infs 或者 NaNs, 那么调用optimizer.step()来更新权重,
-            # 如果检测到出现了inf或者NaN，就跳过这次梯度更新，同时动态调整scaler的大小
-            args.scaler.step(optimizer)
-            # optimizer.step()
-
-            # 查看是否要更新scaler,这个要注意不能丢
-            args.scaler.update()
-            batch_avg_loss = _reduce_tensor(args, batch_avg_loss)
+            batch_avg_loss.backward()
+            optimizer.step()
+            batch_avg_loss = _reduce_tensor(batch_avg_loss, args.world_size)
         else:
             batch_avg_loss.backward()
             optimizer.step()
@@ -262,11 +249,13 @@ def train_epoch(epoch, train_loader, model, criterion, optimizer, lr_scheduler,
 
     if args.local_rank != -1:
         # all reduce the statistical confusion matrix
-        torch.distributed.barrier()
+        dist.barrier()
         # 统计所有进程的train_stat里的confusion matrix
         # 由于ddp通信只能通过tensor, 所以这里采用cm，信息最全面，
         # 可操作性强
-        train_stat._cm = _reduce_tensor(args, train_stat._cm, op='sum')
+        train_stat._cm = _reduce_tensor(train_stat._cm,
+                                        args.world_size,
+                                        op='sum')
 
     lr_scheduler.step()  # 如果是iter更新，则放入内循环
 
@@ -293,17 +282,16 @@ def eval_epoch(epoch, val_loader, model, criterion, num_samples_per_cls, args):
 
         batch_imgs, batch_targets = batch_imgs.cuda(), batch_targets.cuda()
 
-        with autocast():
-            batch_probs = model(batch_imgs)
-            batch_avg_loss = criterion(batch_probs, batch_targets)
+        batch_probs = model(batch_imgs)
+        batch_avg_loss = criterion(batch_probs, batch_targets)
 
         if args.local_rank != -1:
-            torch.distributed.barrier()
+            dist.barrier()
             # torch.distributed.barrier()的作用是，阻塞进程
             # 确保每个进程都运行到这一行代码，才能继续执行，这样计算
             # 平均loss和平均acc的时候，不会出现因为进程执行速度不一致
             # 而导致错误
-            batch_avg_loss = _reduce_tensor(args, batch_avg_loss)
+            batch_avg_loss = _reduce_tensor(batch_avg_loss, args.world_size)
 
         val_loss_meter.update(batch_avg_loss.item())
         batch_preds = torch.argmax(batch_probs, dim=1)
@@ -315,11 +303,11 @@ def eval_epoch(epoch, val_loader, model, criterion, num_samples_per_cls, args):
 
     if args.local_rank != -1:
         # all reduce the statistical confusion matrix
-        torch.distributed.barrier()
+        dist.barrier()
         # 统计所有进程的train_stat里的confusion matrix
         # 由于ddp通信只能通过tensor, 所以这里采用cm，信息最全面，
         # 可操作性强
-        val_stat._cm = _reduce_tensor(args, val_stat._cm, op='sum')
+        val_stat._cm = _reduce_tensor(val_stat._cm, args.world_size, op='sum')
 
     if args.local_rank in [-1, 0]:
         val_pbar.set_postfix_str(f"Loss:{val_loss_meter.avg:>4.2f} "
@@ -328,14 +316,14 @@ def eval_epoch(epoch, val_loader, model, criterion, num_samples_per_cls, args):
     return val_stat, val_loss_meter.avg
 
 
-def _reduce_tensor(args, tensor, op='mean'):
-    with torch.no_grad():
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+def _reduce_tensor(tensor, nproc, op='mean'):
+    reduced_tensor = tensor.clone()
+    dist.all_reduce(reduced_tensor, op=dist.ReduceOp.SUM)
 
-        if op == 'mean':
-            tensor /= args.world_size
+    if op == 'mean':
+        reduced_tensor /= nproc
 
-    return tensor
+    return reduced_tensor
 
 
 def _set_random_seed(seed=0, cuda_deterministic=False):
@@ -364,14 +352,14 @@ def _set_random_seed(seed=0, cuda_deterministic=False):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    # 采用env模式启动ddp, args.local_rank参数会自动读取，不能修改
     parser.add_argument('--local_rank',
                         type=int,
-                        help='Local Rank for\
-                        distributed training. if single-GPU, default: -1')
+                        default=-1,
+                        help='Local Rank for distributed training. '
+                        'if single-GPU, default: -1')
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--lr", type=float, default=0.1)
-    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--total-epoch", type=int, default=100)
 
@@ -385,5 +373,6 @@ if __name__ == '__main__':
 
     if "LOCAL_RANK" in os.environ:
         args.local_rank = int(os.environ["LOCAL_RANK"])
+
     _set_random_seed(args.seed)
     main(args)
